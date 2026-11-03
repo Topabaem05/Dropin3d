@@ -17,7 +17,7 @@ Apple Silicon(MPS)이나 CPU에서는 같은 API를 가진 이식 가능한 구�
 | `cuml.KMeans`, `cuml.HDBSCAN` | `dropin3d.cluster` | scikit-learn | ⚠️ KMeans 초기화 알고리즘이 달라 label이 다름 |
 | CuPy 배열 코드 | `dropin3d.array` (`xp`) | NumPy | ✅ 같음 |
 | `fused_ssim` | `dropin3d.ssim.fused_ssim` | fused-ssim의 MPS 커널, 없으면 PyTorch SSIM | ✅ 같은 정의 |
-| `gsplat.rasterization` | `dropin3d.raster.rasterization` | [mpsplat](https://github.com/zacsmms/mpsplat)의 Metal 커널을 쓰도록 3채널 분할 + background 직접 합성 | ⚠️ mpsplat 커널 자체가 gsplat과 조금 다름 (아래 참고) |
+| `gsplat.rasterization` | `dropin3d.raster.rasterization` | [mpsplat](https://github.com/zacsmms/mpsplat)의 Metal 커널을 쓰도록 3채널 분할 + background 직접 합성 | ⚠️ mpsplat 패치를 적용하면 gsplat 1.5.3과 같은 합성 규칙 (아래 참고) |
 | `torch.autocast("cuda", bfloat16)` | `dropin3d.precision` | 하드웨어에 맞는 dtype 선택 (sm_80 미만, MPS, CPU는 fp32) | ✅ 같거나 더 정밀함 |
 | `torch.device("cuda")`, `torch.cuda.empty_cache()` | `dropin3d.device` | cuda → mps → cpu 자동 선택 | ✅ |
 
@@ -72,14 +72,10 @@ from dropin3d.precision import resolve_precision, autocast_context, no_autocast
 | `DROPIN3D_SSIM_BACKEND` | `torch` | PyTorch SSIM을 강제로 사용 |
 | `DROPIN3D_CHUNKED_RASTER` | `1` / `0` / `force` | MPS 3채널 분할 렌더링 (`force` = 모든 device, 테스트용) |
 
-## 알려진 차이 (mpsplat)
-mpsplat의 Metal 래스터라이저는 gsplat 1.5.3 CUDA 커널과 다음이 다릅니다(코드 기준 조사).
-- alpha < 1/255인 Gaussian을 건너뛰지 않음
-- transmittance < 1e-4에서 조기 종료하지 않음
-- alpha 상한이 0.99 (CUDA는 0.999)
-- 역전파가 float atomic이라 실행마다 결과가 조금씩 다름
-
-CUDA와 같은 결과가 필요하면 셰이더 패치가 필요합니다(진행 예정).
+## mpsplat과 gsplat 1.5.3의 차이
+mpsplat의 래스터라이저는 gsplat 1.5.3 CUDA 커널과 합성 규칙이 다릅니다: alpha 상한 0.99(CUDA는 0.999), alpha < 1/255 건너뛰기 없음, T ≤ 1e-4 조기 종료 없음.
+[`third_party/mpsplat-patches/`](third_party/mpsplat-patches/)의 patch를 적용하면 Metal 커널과 PyTorch 경로가 모두 gsplat 1.5.3과 같은 규칙을 따릅니다.
+Mac에서 [`tools/check_mpsplat_parity.py`](tools/check_mpsplat_parity.py)로 두 경로를 비교할 수 있습니다.
 
 ## 통합 예시
 - [4DGS360](https://github.com/Jaewon040/4DGS360): [`integrations/4dgs360/`](integrations/4dgs360/), 상세 문서는 [`docs/4dgs360.md`](docs/4dgs360.md)

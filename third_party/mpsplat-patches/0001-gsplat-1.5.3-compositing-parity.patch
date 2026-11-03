@@ -1,0 +1,144 @@
+diff --git a/gsplat/cuda/_torch_rasterize.py b/gsplat/cuda/_torch_rasterize.py
+index 6522743..4ba4278 100644
+--- a/gsplat/cuda/_torch_rasterize.py
++++ b/gsplat/cuda/_torch_rasterize.py
+@@ -16,7 +16,13 @@ import math
+ import torch
+ from torch import Tensor
+ 
+-from ._constants import MAX_ALPHA
++from ._constants import ALPHA_THRESHOLD, MAX_ALPHA, TRANSMITTANCE_THRESHOLD
++
++# dropin3d patch (gsplat 1.5.3 parity): the 3DGS rasterizer below follows
++# `RasterizeToPixels3DGSFwd.cu` of gsplat 1.5.3 (alpha cap 0.999, skip
++# alpha < 1/255, exclusive early stop at T <= 1e-4). MAX_ALPHA (0.99) is
++# still used by the other rasterizers in this package.
++MAX_ALPHA_3DGS = 0.999
+ 
+ 
+ def _rasterize_to_pixels_torch(
+@@ -106,16 +112,24 @@ def _rasterize_to_pixels_torch(
+                 cn[:, 0, None, None] * delta[..., 0] ** 2
+                 + cn[:, 2, None, None] * delta[..., 1] ** 2
+             ) + cn[:, 1, None, None] * delta[..., 0] * delta[..., 1]  # [k, ph, pw]
+-            alpha = (op[:, None, None] * torch.exp(-sigma)).clamp(max=MAX_ALPHA)
+-            alpha = torch.where(sigma < 0, torch.zeros_like(alpha), alpha)
++            alpha = (op[:, None, None] * torch.exp(-sigma)).clamp(max=MAX_ALPHA_3DGS)
++            # Skipped Gaussians (sigma < 0 or alpha < 1/255) get alpha = 0, so
++            # they leave T unchanged, as `continue` does in the CUDA kernel.
++            valid = (sigma >= 0) & (alpha >= ALPHA_THRESHOLD)
++            alpha = torch.where(valid, alpha, torch.zeros_like(alpha))
+ 
+             # Front-to-back compositing along the leading "k" axis.
+             # T_i = ∏_{j<i} (1 - α_j)  →  use cumulative product of (1 - α).
+-            one_minus = (1.0 - alpha).clamp(min=1e-7)
++            one_minus = 1.0 - alpha
++            trans_after = one_minus.cumprod(dim=0)  # T after each Gaussian
+             # Pre-shift so trans[0] = 1.
+             ones = torch.ones_like(one_minus[:1])
+-            trans = torch.cat([ones, one_minus[:-1]], dim=0).cumprod(dim=0)  # [k, ph, pw]
+-            weights = alpha * trans  # [k, ph, pw]
++            trans = torch.cat([ones, trans_after[:-1]], dim=0)  # [k, ph, pw]
++            # Early stop: the first valid Gaussian whose T_after <= 1e-4 is
++            # excluded, and so is everything behind it.
++            stop = valid & (trans_after <= TRANSMITTANCE_THRESHOLD)
++            done = stop.cumsum(dim=0) > 0
++            weights = torch.where(done, torch.zeros_like(alpha), alpha * trans)
+ 
+             tile_color = (weights.unsqueeze(-1) * col[:, None, None, :]).sum(dim=0)  # [ph, pw, C]
+             tile_alpha = weights.sum(dim=0, keepdim=True).permute(1, 2, 0)  # [ph, pw, 1]
+diff --git a/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_bwd.metal b/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_bwd.metal
+index 1580252..69adf73 100644
+--- a/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_bwd.metal
++++ b/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_bwd.metal
+@@ -19,14 +19,23 @@
+ //     kernel's relaxed flavour (no alpha-threshold cull, no early-exit) —
+ //     the forward stays paired with its bwd; if Stage 7.x reintroduces
+ //     CUDA's optimisations both kernels move together.
++//
++// dropin3d patch (gsplat 1.5.3 parity): paired with the patched forward.
++// Same rules as `RasterizeToPixels3DGSBwd.cu` of gsplat 1.5.3:
++//   * alpha = min(0.999, opacity * exp(-sigma))
++//   * skip the Gaussian if sigma < 0 or alpha < 1/255
++//   * ra = 1 / (1 - alpha), no clamp (alpha <= 0.999 keeps it finite)
++//   * the forward's early stop is honoured through last_ids (bin_final).
++// Gradients are still accumulated with per-thread float atomics, so their
++// summation order (and the last bits of the result) is not deterministic.
+ 
+ #include <metal_stdlib>
+ using namespace metal;
+ 
+ constant constexpr uint  TILE_SIZE              = 16u;
+ constant constexpr uint  BLOCK_SIZE             = TILE_SIZE * TILE_SIZE;
+-constant constexpr float MAX_ALPHA              = 0.99f;
+-constant constexpr float MIN_ONE_MINUS_ALPHA    = 1e-7f;
++constant constexpr float MAX_ALPHA              = 0.999f;  // gsplat 1.5.3
++constant constexpr float ALPHA_THRESHOLD        = 1.0f / 255.0f;
+ 
+ kernel void rasterize_to_pixels_3dgs_bwd(
+     // gradient outputs (atomic — one per leaf input)
+@@ -114,13 +123,13 @@ kernel void rasterize_to_pixels_3dgs_bwd(
+         const float sigma = 0.5f * (cn.x * dx * dx + cn.z * dy * dy)
+                           + cn.y * dx * dy;
+         const float vis = exp(-sigma);
+-        float alpha = min(MAX_ALPHA, opac * vis);
+-        if (sigma < 0.0f) {
+-            alpha = 0.0f;
++        const float alpha = min(MAX_ALPHA, opac * vis);
++        if (sigma < 0.0f || alpha < ALPHA_THRESHOLD) {
++            continue;  // skipped in the forward as well
+         }
+ 
+         // Rewind transmittance: T_at_g = T_after_g / (1 - alpha)
+-        const float ra = 1.0f / max(MIN_ONE_MINUS_ALPHA, 1.0f - alpha);
++        const float ra = 1.0f / (1.0f - alpha);
+         T *= ra;
+         const float fac = alpha * T;
+ 
+diff --git a/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_fwd.metal b/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_fwd.metal
+index 8c3759b..dd106ad 100644
+--- a/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_fwd.metal
++++ b/gsplat/mps/_shaders/rasterize_to_pixels_3dgs_fwd.metal
+@@ -23,13 +23,21 @@
+ //     pad to (4/8/16/...).
+ //   * `extern __shared__` becomes a fixed-size `threadgroup` buffer sized
+ //     for the largest tile we support: tile_size <= 16, so block_size = 256.
++//
++// dropin3d patch (gsplat 1.5.3 parity): the compositing rules now match
++// `RasterizeToPixels3DGSFwd.cu` of gsplat 1.5.3:
++//   * alpha = min(0.999, opacity * exp(-sigma))          (was 0.99)
++//   * skip the Gaussian if sigma < 0 or alpha < 1/255     (was: kept, alpha=0)
++//   * next_T = T * (1 - alpha), no clamp                  (was max(.., 1e-7))
++//   * stop when next_T <= 1e-4, excluding that Gaussian   (was: no early stop)
++//   * last_ids holds the index of the last *contributing* Gaussian.
+ 
+ #include <metal_stdlib>
+ using namespace metal;
+ 
+ constant constexpr uint TILE_SIZE   = 16u;
+ constant constexpr uint BLOCK_SIZE  = TILE_SIZE * TILE_SIZE;
+-constant constexpr float MAX_ALPHA              = 0.99f;
++constant constexpr float MAX_ALPHA              = 0.999f;  // gsplat 1.5.3
+ constant constexpr float ALPHA_THRESHOLD        = 1.0f / 255.0f;
+ constant constexpr float TRANSMITTANCE_THRESHOLD = 1e-4f;
+ 
+@@ -117,12 +125,14 @@ kernel void rasterize_to_pixels_3dgs_fwd(
+             const float dy = xy.y - py;
+             const float sigma =
+                 0.5f * (cn.x * dx * dx + cn.z * dy * dy) + cn.y * dx * dy;
+-            float alpha = opac * exp(-sigma);
+-            alpha = min(MAX_ALPHA, alpha);
+-            if (sigma < 0.0f) {
+-                alpha = 0.0f;
++            const float alpha = min(MAX_ALPHA, opac * exp(-sigma));
++            if (sigma < 0.0f || alpha < ALPHA_THRESHOLD) {
++                continue;
++            }
++            const float next_T = T * (1.0f - alpha);
++            if (next_T <= TRANSMITTANCE_THRESHOLD) {  // pixel is done: exclusive
++                break;
+             }
+-            const float next_T = T * max(1.0f - alpha, 1e-7f);
+             const float vis = alpha * T;
+             const uint c_off = (uint)g * CDIM;
+             pix_out[0] += colors[c_off + 0] * vis;
