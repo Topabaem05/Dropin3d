@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dropin3d"
+version = "0.1.0"
+description = "Drop-in replacements for CUDA-only libraries in 3D vision (gsplat, pytorch3d kNN, pointops2, cuML, fused-ssim) for Apple Silicon (MPS) and CPU"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1", "numpy"]
+
+[project.optional-dependencies]
+cluster = ["scikit-learn>=1.3"]
+test = ["pytest", "scikit-learn>=1.3", "pytorch-msssim"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

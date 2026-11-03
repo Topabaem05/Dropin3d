@@ -1,0 +1,700 @@
+diff --git a/flow3d/data/iphone_dataset.py b/flow3d/data/iphone_dataset.py
+index 80484a4..115cef2 100644
+--- a/flow3d/data/iphone_dataset.py
++++ b/flow3d/data/iphone_dataset.py
+@@ -11,6 +11,7 @@ import imageio.v3 as iio
+ import numpy as np
+ import roma
+ import torch
++from dropin3d import get_device
+ import torch.nn.functional as F
+ import tyro
+ from loguru import logger as guru
+@@ -303,14 +304,14 @@ class iPhoneDataset(BaseDataset):
+                         range(self.num_frames), desc="Processing depths", leave=False
+                     ):
+                         depth = masked_median_blur(
+-                            self.depths[[i]].unsqueeze(1).to("cuda"),
++                            self.depths[[i]].unsqueeze(1).to(get_device()),
+                             (
+                                 self.masks[[i]]
+                                 * self.valid_masks[[i]]
+                                 * (self.depths[[i]] > 0)
+                             )
+                             .unsqueeze(1)
+-                            .to("cuda"),
++                            .to(get_device()),
+                         )[0, 0].cpu()
+                         self.depths[i] = depth * self.masks[i] + self.depths[i] * (
+                             1 - self.masks[i]
+diff --git a/flow3d/init_utils.py b/flow3d/init_utils.py
+index cfc6233..9ca6ccc 100644
+--- a/flow3d/init_utils.py
++++ b/flow3d/init_utils.py
+@@ -1,16 +1,16 @@
+ import time
+ from typing import Literal
+ 
+-import cupy as cp
+ import numpy as np
+ 
+ import roma
+ import torch
+ import torch.nn.functional as F
+-from cuml import HDBSCAN, KMeans
+ from loguru import logger as guru
+ from tqdm import tqdm
+ 
++from dropin3d.array import get_array_module, to_array
++from dropin3d.cluster import hdbscan_labels, kmeans_labels
+ from flow3d.loss_utils import (
+     compute_accel_loss,
+     compute_se3_smoothness_loss,
+@@ -525,42 +525,44 @@ def sample_initial_bases_centers(
+     means_canonical = tracks_3d.xyz[:, cano_t].clone()
+ 
+     # linearly interpolate missing 3d points
+-    xyz = cp.asarray(tracks_3d.xyz)  # [gaussian, T, 3]
++    xyz = to_array(tracks_3d.xyz)  # [gaussian, T, 3] (CuPy on CUDA, else NumPy)
+     # print(f"{xyz.shape=}")
+-    visibles = cp.asarray(tracks_3d.visibles)
++    visibles = to_array(tracks_3d.visibles)
++    xp = get_array_module(xyz)
+ 
+     num_tracks = xyz.shape[0]
+     xyz_interp = batched_interp_masked(xyz, visibles)
+ 
+     velocities = xyz_interp[:, 1:] - xyz_interp[:, :-1]
+     vel_dirs = (
+-        velocities / (cp.linalg.norm(velocities, axis=-1, keepdims=True) + 1e-5)
++        velocities / (xp.linalg.norm(velocities, axis=-1, keepdims=True) + 1e-5)
+     ).reshape(
+         (num_tracks, -1)
+     )  # [gaussian, 3 * T]
+ 
+     # [num_bases, num_gaussians]
+     if mode == "kmeans":
+-        model = KMeans(n_clusters=num_bases)
++        labels = kmeans_labels(vel_dirs, n_clusters=num_bases)
+     else:
+-        model = HDBSCAN(min_cluster_size=20, max_cluster_size=num_tracks // 4)
+-    model.fit(vel_dirs)
+-    labels = model.labels_
++        labels = hdbscan_labels(
++            vel_dirs, min_cluster_size=20, max_cluster_size=num_tracks // 4
++        )
++    labels = torch.from_numpy(labels).to(means_canonical.device)
+     num_bases = labels.max().item() + 1
+     sampled_centers = torch.stack(
+         [
+-            means_canonical[torch.tensor(labels == i)].median(dim=0).values
++            means_canonical[labels == i].median(dim=0).values
+             for i in range(num_bases)
+         ]
+     )[
+         None
+     ]  # the cluster center at the canonical timestep
+-    return sampled_centers, num_bases, torch.tensor(labels)
++    return sampled_centers, num_bases, labels
+ 
+ 
+-def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarray:
++def interp_masked(vals, mask, pad: int = 1):
+     """
+-    hacky way to interpolate batched with cupy
++    hacky way to interpolate batched with cupy (or numpy when CuPy is absent)
+     by concatenating the batches and pad with dummy values
+     :param vals: [B, M, *]
+     :param mask: [B, M]
+@@ -569,48 +571,50 @@ def interp_masked(vals: cp.ndarray, mask: cp.ndarray, pad: int = 1) -> cp.ndarra
+     assert vals.shape[:2] == mask.shape
+ 
+     B, M = mask.shape
++    xp = get_array_module(vals)
+ 
+     # get the first and last valid values for each track
+     sh = vals.shape[2:]
+     vals = vals.reshape((B, M, -1))
+     D = vals.shape[-1]
+-    first_val_idcs = cp.argmax(mask, axis=-1)
+-    last_val_idcs = M - 1 - cp.argmax(cp.flip(mask, axis=-1), axis=-1)
+-    bidcs = cp.arange(B)
++    first_val_idcs = xp.argmax(mask, axis=-1)
++    last_val_idcs = M - 1 - xp.argmax(xp.flip(mask, axis=-1), axis=-1)
++    bidcs = xp.arange(B)
+ 
+     v0 = vals[bidcs, first_val_idcs][:, None]
+     v1 = vals[bidcs, last_val_idcs][:, None]
+     m0 = mask[bidcs, first_val_idcs][:, None]
+     m1 = mask[bidcs, last_val_idcs][:, None]
+     if pad > 1:
+-        v0 = cp.tile(v0, [1, pad, 1])
+-        v1 = cp.tile(v1, [1, pad, 1])
+-        m0 = cp.tile(m0, [1, pad])
+-        m1 = cp.tile(m1, [1, pad])
++        v0 = xp.tile(v0, [1, pad, 1])
++        v1 = xp.tile(v1, [1, pad, 1])
++        m0 = xp.tile(m0, [1, pad])
++        m1 = xp.tile(m1, [1, pad])
+ 
+-    vals_pad = cp.concatenate([v0, vals, v1], axis=1)
+-    mask_pad = cp.concatenate([m0, mask, m1], axis=1)
++    vals_pad = xp.concatenate([v0, vals, v1], axis=1)
++    mask_pad = xp.concatenate([m0, mask, m1], axis=1)
+ 
+     M_pad = vals_pad.shape[1]
+     vals_flat = vals_pad.reshape((B * M_pad, -1))
+     mask_flat = mask_pad.reshape((B * M_pad,))
+-    idcs = cp.where(mask_flat)[0]
++    idcs = xp.where(mask_flat)[0]
+ 
+-    cx = cp.arange(B * M_pad)
+-    out = cp.zeros((B * M_pad, D), dtype=vals_flat.dtype)
++    cx = xp.arange(B * M_pad)
++    out = xp.zeros((B * M_pad, D), dtype=vals_flat.dtype)
+     for d in range(D):
+-        out[:, d] = cp.interp(cx, idcs, vals_flat[idcs, d])
++        out[:, d] = xp.interp(cx, idcs, vals_flat[idcs, d])
+ 
+     out = out.reshape((B, M_pad, *sh))[:, pad:-pad]
+     return out
+ 
+ 
+ def batched_interp_masked(
+-    vals: cp.ndarray, mask: cp.ndarray, batch_num: int = 4096, batch_time: int = 64
++    vals, mask, batch_num: int = 4096, batch_time: int = 64
+ ):
+     assert mask.ndim == 2
+     B, M = mask.shape
+-    out = cp.zeros_like(vals)
++    xp = get_array_module(vals)
++    out = xp.zeros_like(vals)
+     for b in tqdm(range(0, B, batch_num), leave=False):
+         for m in tqdm(range(0, M, batch_time), leave=False):
+             x = interp_masked(
+diff --git a/flow3d/params.py b/flow3d/params.py
+index eceb787..3f3207d 100644
+--- a/flow3d/params.py
++++ b/flow3d/params.py
+@@ -4,10 +4,11 @@ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+ 
+-from pytorch3d.ops import knn_points
++from dropin3d import get_device
++from dropin3d.cluster import kmeans_labels
++from dropin3d.knn import knn_points
+ from loguru import logger as guru
+ from tqdm import tqdm
+-from cuml import KMeans
+ 
+ from flow3d.transforms import (
+     cont_6d_to_rmat,
+@@ -260,7 +261,7 @@ class MotionTree(nn.Module):
+         ) -> None:
+         super().__init__()
+ 
+-        self.device = torch.device("cuda:0")
++        self.device = get_device()
+ 
+         # get num of levels
+         assert len(child_nodes_per_level) == len(motion_bases_per_level) # should have same num of levels
+@@ -436,9 +437,8 @@ class MotionTree(nn.Module):
+     
+     def _perform_kmeans_clustering(self, features, num_clusters):
+         """ Perform K-means clustering on the features."""
+-        kmeans_model = KMeans(n_clusters=num_clusters)
+-        kmeans_model.fit(features)
+-        cluster_ids = torch.as_tensor(kmeans_model.labels_)
++        labels = kmeans_labels(features.detach(), n_clusters=num_clusters)
++        cluster_ids = torch.as_tensor(labels, device=features.device)
+         if len(cluster_ids.unique()) != num_clusters:
+             return None
+         return cluster_ids
+diff --git a/flow3d/scene_model.py b/flow3d/scene_model.py
+index b2f29b2..7f7f367 100644
+--- a/flow3d/scene_model.py
++++ b/flow3d/scene_model.py
+@@ -2,7 +2,7 @@ import roma
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+-from gsplat.rendering import rasterization
++from dropin3d.raster import rasterization  # gsplat on CUDA, Metal-friendly chunks on MPS
+ 
+ from flow3d.params import GaussianParams, MotionTree
+ 
+diff --git a/flow3d/trainer.py b/flow3d/trainer.py
+index 89a0d0c..6be2ed7 100644
+--- a/flow3d/trainer.py
++++ b/flow3d/trainer.py
+@@ -8,7 +8,8 @@ import torch
+ import torch.nn.functional as F
+ from loguru import logger as guru
+ from nerfview import CameraState
+-from fused_ssim import fused_ssim
++from dropin3d import empty_cache
++from dropin3d.ssim import fused_ssim
+ from lpips import LPIPS
+ from torch import nn
+ from torch.utils.tensorboard import SummaryWriter  # type: ignore
+@@ -1373,7 +1374,7 @@ def dup_in_optim(optimizer, new_params: list, should_dup: torch.Tensor, num_dups
+         optimizer.state[p_new] = param_state
+         optimizer.param_groups[i]["params"] = [p_new]
+         del old_params
+-        torch.cuda.empty_cache()
++        empty_cache()
+ 
+ 
+ def remove_from_optim(optimizer, new_params: list, _should_cull: torch.Tensor):
+@@ -1391,7 +1392,7 @@ def remove_from_optim(optimizer, new_params: list, _should_cull: torch.Tensor):
+         optimizer.state[p_new] = param_state
+         optimizer.param_groups[i]["params"] = [p_new]
+         del old_params
+-        torch.cuda.empty_cache()
++        empty_cache()
+ 
+ 
+ def reset_in_optim(optimizer, new_params: list):
+@@ -1407,7 +1408,7 @@ def reset_in_optim(optimizer, new_params: list):
+         optimizer.state[p_new] = param_state
+         optimizer.param_groups[i]["params"] = [p_new]
+         del old_params
+-        torch.cuda.empty_cache()
++        empty_cache()
+ 
+ 
+ def add_in_optim(optimizer, new_params: list, num_add: int):
+@@ -1425,7 +1426,7 @@ def add_in_optim(optimizer, new_params: list, num_add: int):
+         optimizer.state[p_new] = param_state
+         optimizer.param_groups[i]["params"] = [p_new]
+         del old_params
+-        torch.cuda.empty_cache()
++        empty_cache()
+ 
+ 
+ def convert_to_buffer(module: nn.Module, persistent: bool = True):
+diff --git a/preproc/AnchorTAP3D/inference.py b/preproc/AnchorTAP3D/inference.py
+index 9a7d710..c7407dc 100755
+--- a/preproc/AnchorTAP3D/inference.py
++++ b/preproc/AnchorTAP3D/inference.py
+@@ -9,6 +9,8 @@ from pathlib import Path
+ from datetime import datetime
+ from einops import repeat
+ from utils.common_utils import setup_logger
++from dropin3d import get_device
++from dropin3d.precision import autocast_context, resolve_precision
+ import logging
+ from annotation.megasam import MegaSAMAnnotator
+ import numpy as np
+@@ -228,7 +230,8 @@ def load_and_process_2dtrack(
+ 
+ class Arguments(tap.Tap):
+     work_dir: str
+-    device: str = "cuda"
++    device: str = "auto"  # "auto" picks cuda > mps > cpu
++    precision: str = "auto"  # auto | bf16 | fp16 | fp32. auto = bf16 on CUDA sm_80+, else fp32
+     num_iters: int = 6
+     support_grid_size: int = 16
+     use_support_grid: bool = False  # If set, keep support_grid_size as-is in prepare_inputs (otherwise it is forced to 0 when query_point is None)
+@@ -577,6 +580,9 @@ def prepare_inputs(img_dir: str, inference_res: Tuple[int, int], support_grid_si
+ if __name__ == "__main__":
+     setup_logger()
+     args = Arguments().parse_args()
++    args.device = str(get_device(args.device))
++    autocast_dtype = resolve_precision(args.device, args.precision)
++    logger.info(f"Device: {args.device}, autocast dtype: {autocast_dtype}")
+ 
+     # Setup paths
+     work_dir = Path(args.work_dir)
+@@ -907,7 +913,7 @@ if __name__ == "__main__":
+                 )
+ 
+         # Run inference
+-        with torch.autocast("cuda", dtype=torch.bfloat16):
++        with autocast_context(args.device, autocast_dtype):
+             coords, visibs = inference(
+                 model=model,
+                 video=video,
+diff --git a/preproc/AnchorTAP3D/models/corr_features/knn_feature_4d_optimized.py b/preproc/AnchorTAP3D/models/corr_features/knn_feature_4d_optimized.py
+index 3dc84b2..3d19ec0 100755
+--- a/preproc/AnchorTAP3D/models/corr_features/knn_feature_4d_optimized.py
++++ b/preproc/AnchorTAP3D/models/corr_features/knn_feature_4d_optimized.py
+@@ -14,7 +14,8 @@ from ..utils.cotracker_utils import posenc, bilinear_sampler, get_support_points
+ from models.utils.cotracker_blocks import Attention, CrossAttnBlock, AttnBlock
+ logger = logging.getLogger(__name__)
+ 
+-import third_party.pointops2.functions.pointops as pointops
++from dropin3d import knn as pointops  # pointops2 on CUDA, exact torch kNN elsewhere
++from dropin3d.precision import no_autocast
+ 
+ def _get_index_offset_for_knnquery(batch_indices, dtype=torch.long):
+     """A helper function to get index offset from ordered
+@@ -501,7 +502,7 @@ class KNNCorrFeature4D_Optimized(nn.Module):
+         B, T, feature_dim, H, W = ctx.feat_pyramid[level].shape
+         num_points = ctx.query_feat_pyramid[level].shape[-2]
+ 
+-        with torch.autocast("cuda", enabled=False):
++        with no_autocast():
+             map_pcds = rearrange(ctx.pcd_pyramid[level], 'b t c h w -> (b t) (h w) c')
+             map_feats = rearrange(ctx.feat_pyramid[level], 'b t c h w -> (b t) (h w) c')
+             curr_coords = rearrange(curr_coords, 'b t n c -> (b t) n c')
+@@ -586,7 +587,7 @@ class KNNCorrFeature4D_Optimized(nn.Module):
+ 
+         curr_knn_idxs = []
+         original_indices_list = []  # Store original indices for each level
+-        with torch.autocast("cuda", enabled=False):
++        with no_autocast():
+             knn_inputs: List[KNNQueryInput] = []
+             for i in range(self.corr_levels):
+                 map_pcds = rearrange(ctx.pcd_pyramid[i], 'b t c h w -> (b t) (h w) c')
+diff --git a/preproc/AnchorTAP3D/models/point_tracker_3d.py b/preproc/AnchorTAP3D/models/point_tracker_3d.py
+index dc9ee4a..41ad607 100755
+--- a/preproc/AnchorTAP3D/models/point_tracker_3d.py
++++ b/preproc/AnchorTAP3D/models/point_tracker_3d.py
+@@ -23,6 +23,7 @@ from .encoders import load_encoder
+ from functools import partial
+ 
+ from torch.profiler import record_function
++from dropin3d.precision import no_autocast
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -370,7 +371,7 @@ class PointTracker3D(nn.Module):
+             query_frames,
+         ] # B, N, 4, 4
+ 
+-        with torch.autocast(device_type="cuda", enabled=False):
++        with no_autocast():
+ 
+             original_ctx.inv_extrinsics = torch.linalg.inv(original_ctx.extrinsics)
+             original_ctx.camera_locs = original_ctx.inv_extrinsics[..., :3, 3]
+@@ -490,7 +491,7 @@ class PointTracker3D(nn.Module):
+             guidance_2d=windowed_guidance,
+             track_vis_threshold=track_vis_threshold,
+         ):
+-            with torch.autocast(device_type="cuda", enabled=False):
++            with no_autocast():
+                 # first denormalize the coords
+                 if self.norm_mode != "none":
+                     assert self.norm_mode in ["anisotropy", "isotropic"], "norm_mode must be one of 'anisotropy', 'isotropic'"
+@@ -559,7 +560,7 @@ class PointTracker3D(nn.Module):
+         if mode == "training":
+             assert "local" in flags, "data should be transformed to local space before sending to training"
+         elif self.eval_mode != "raw" and not transformed:
+-            with torch.autocast(device_type="cuda", enabled=False):
++            with no_autocast():
+                 B, T = rgb_obs.shape[:2]
+                 N = query_point.shape[1]
+ 
+@@ -603,7 +604,7 @@ class PointTracker3D(nn.Module):
+                 track_vis_threshold=track_vis_threshold,
+                 masks=masks,
+             ):
+-                with torch.autocast(device_type="cuda", enabled=False):
++                with no_autocast():
+                     if isinstance(output, TrainData):
+                         output.coords = [apply_homo_transform(coords_, transform=_inv_extrinsics[:, output.frame_range[0]:output.frame_range[1], None, :, :]) for coords_ in output.coords]
+                     else:
+diff --git a/preproc/AnchorTAP3D/utils/common_utils.py b/preproc/AnchorTAP3D/utils/common_utils.py
+index 16d2c33..f3b19a8 100755
+--- a/preproc/AnchorTAP3D/utils/common_utils.py
++++ b/preproc/AnchorTAP3D/utils/common_utils.py
+@@ -12,6 +12,7 @@ from third_party.cotracker.model_utils import bilinear_sampler
+ from dataclasses import fields, is_dataclass
+ from functools import wraps
+ from box import Box
++from dropin3d.precision import no_autocast
+ 
+ def setup_logger():
+     FORMAT = "%(message)s"
+@@ -53,7 +54,7 @@ def ensure_float32(allow_cast: bool = True):
+         def wrapper(*args, **kwargs):
+             new_args = tuple(convert_tensor_struct(arg, allow_cast) for arg in args)
+             new_kwargs = {key: convert_tensor_struct(value, allow_cast) for key, value in kwargs.items()}
+-            with torch.autocast(device_type='cuda', enabled=False):
++            with no_autocast():
+                 return convert_tensor_struct(func(*new_args, **new_kwargs), True)
+         return wrapper
+     return decorator
+diff --git a/requirements-mac.txt b/requirements-mac.txt
+new file mode 100644
+index 0000000..502d231
+--- /dev/null
++++ b/requirements-mac.txt
+@@ -0,0 +1,35 @@
++# Apple Silicon (MPS) environment for 4DGS360 training / rendering / evaluation.
++# See https://github.com/Topabaem05/Dropin3d (docs/4dgs360.md). CUDA-only packages from requirements.txt are removed:
++#   RAPIDS (cuML, cuDF, ...), CuPy  -> scikit-learn / NumPy via dropin3d
++#   pytorch3d                        -> exact torch kNN via dropin3d
++#   gsplat==1.5.3 (CUDA)             -> mpsplat, a Metal fork that keeps the `gsplat` package name
++# Recent PyTorch is needed for MPS kernels (e.g. torch.mps.compile_shader used by mpsplat).
++torch>=2.9
++torchvision
++viser
++opencv-python
++imageio
++imageio-ffmpeg
++matplotlib
++tensorboard
++scikit-learn>=1.3
++jaxtyping
++roma
++ninja
++pytorch-msssim
++fsspec
++loguru
++wandb
++transformers==4.44.2
++einops
++lpips
++nerfview==0.0.3
++torchmetrics
++splines==0.3.2
++pyyaml
++huggingface_hub==0.24.7
++dropin3d @ git+https://github.com/Topabaem05/Dropin3d
++# Metal port of gsplat, pinned to the commit that was reviewed.
++gsplat @ git+https://github.com/zacsmms/mpsplat@94c89496f99d74d81e2a298e1f6159cc3978af34
++# fused-ssim has its own MPS backend; install separately with --no-build-isolation:
++#   pip install git+https://github.com/rahul-goel/fused-ssim/ --no-build-isolation
+diff --git a/run_evaluation.py b/run_evaluation.py
+index e526a63..03b6de2 100644
+--- a/run_evaluation.py
++++ b/run_evaluation.py
+@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass
+ from typing import Annotated
+ 
+ import torch
++from dropin3d import get_device
+ import tyro
+ from loguru import logger as guru
+ from torch.utils.data import DataLoader
+@@ -40,7 +41,7 @@ def main(cfg: TrainConfig):
+         get_train_val_datasets(cfg.data, load_val=True)
+     )
+ 
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = get_device()
+     
+     os.makedirs(cfg.work_dir, exist_ok=True)
+ 
+diff --git a/run_rendering.py b/run_rendering.py
+index a227f61..3339593 100644
+--- a/run_rendering.py
++++ b/run_rendering.py
+@@ -5,6 +5,7 @@ from typing import Annotated
+ 
+ import numpy as np
+ import torch
++from dropin3d import get_device
+ import torch.nn.functional as F
+ import tyro
+ from loguru import logger as guru
+@@ -39,7 +40,7 @@ class RenderConfig:
+ 
+ 
+ def main(cfg: RenderConfig):
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = get_device()
+ 
+     ckpt_path = cfg.ckpt_path
+     assert os.path.exists(ckpt_path)
+diff --git a/run_training.py b/run_training.py
+index 2822f45..c1a092e 100644
+--- a/run_training.py
++++ b/run_training.py
+@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
+ from tqdm import tqdm
+ 
+ from flow3d.configs import LossesConfig, OptimizerConfig, SceneLRConfig, load_yaml, update_dataclass
++from dropin3d import get_device, manual_seed_all
+ 
+ from flow3d.data import (
+     BaseDataset,
+@@ -50,9 +51,7 @@ def set_seed(seed):
+     np.random.seed(seed)
+     torch.manual_seed(seed)
+ 
+-    if torch.cuda.is_available():
+-        torch.cuda.manual_seed(seed)
+-        torch.cuda.manual_seed_all(seed)
++    manual_seed_all(seed)
+ 
+ 
+ set_seed(42)
+@@ -100,7 +99,7 @@ def main(cfg: TrainConfig):
+     )
+     guru.info(f"Training dataset has {train_dataset.num_frames} frames")
+ 
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = get_device()
+     
+     if isinstance(cfg.data,NvidiaDataConfig):
+         guru.info("Overriding configuration with Nvidia-specific settings")
+@@ -310,7 +309,7 @@ def init_model_from_tracks(
+         tracks_3d.visibles.sum(dim=0).argmax().item()
+     )  # the time step that the most gaussian is visible
+     guru.info(f"{cano_t=} {num_fg=} {num_bg=} {num_motion_bases=}")
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = get_device()
+ 
+     init_rots, init_ts, motion_coefs, tracks_3d = init_motion_params_with_procrustes(
+         tracks_3d, num_motion_bases, rot_type, cano_t, vis=vis, port=port, invisible_weight=invisible_weight
+diff --git a/run_video.py b/run_video.py
+index eaa5cdc..e1abfeb 100644
+--- a/run_video.py
++++ b/run_video.py
+@@ -6,6 +6,7 @@ from typing import Annotated, Callable
+ import imageio.v3 as iio
+ import numpy as np
+ import torch
++from dropin3d import get_device
+ import torch.nn.functional as F
+ import tyro
+ import yaml
+@@ -209,7 +210,7 @@ def main(cfg: VideoConfig):
+     train_dataset = get_train_val_datasets(cfg.data, load_val=False)[0]
+     guru.info(f"Training dataset has {train_dataset.num_frames} frames")
+ 
+-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
++    device = get_device()
+ 
+     ckpt_path = f"{cfg.work_dir}/checkpoints/last.ckpt"
+     assert os.path.exists(ckpt_path)
+diff --git a/scripts/evaluate_iphone.py b/scripts/evaluate_iphone.py
+index 51375bc..1312b82 100644
+--- a/scripts/evaluate_iphone.py
++++ b/scripts/evaluate_iphone.py
+@@ -6,6 +6,7 @@ import cv2
+ import imageio.v3 as iio
+ import numpy as np
+ import torch
++from dropin3d import get_device
+ from tqdm import tqdm
+ 
+ from flow3d.metrics import mLPIPS, mPSNR, mSSIM, CLIP
+@@ -160,7 +161,7 @@ def load_result_dict(result_dir, val_names):
+ 
+ 
+ def evaluate_nv(data_dict, result_dict):
+-    device = "cuda"
++    device = get_device()
+     psnr_metric = mPSNR().to(device)
+     ssim_metric = mSSIM().to(device)
+     lpips_metric = mLPIPS().to(device)
+diff --git a/scripts/evaluate_iphone360.py b/scripts/evaluate_iphone360.py
+index 8e363ef..eb5c594 100644
+--- a/scripts/evaluate_iphone360.py
++++ b/scripts/evaluate_iphone360.py
+@@ -5,6 +5,7 @@ import os.path as osp
+ import imageio.v3 as iio
+ import numpy as np
+ import torch
++from dropin3d import get_device
+ from tqdm import tqdm
+ 
+ from flow3d.metrics import mLPIPS, mPSNR, mSSIM, CLIP
+@@ -92,7 +93,7 @@ def load_result_dict(result_dir, val_names):
+ 
+ 
+ def evaluate(data_dict, result_dict, val_names=None, per_frame_score=False):
+-    device = "cuda"
++    device = get_device()
+ 
+     # BBFG_LPIPS uses full-frame fg-only render vs GT with white background.
+     bbfg_lpips_metric = mLPIPS().to(device)
+@@ -198,8 +199,9 @@ def compute_simple_bbfg_metrics(result_dir, val_names):
+         print("rgb_bbox directory not found, BBFG_PSNR / BBFG_SSIM will be skipped.")
+         return None, None, None
+ 
+-    psnr_metric = mPSNR().to("cuda")
+-    ssim_metric = mSSIM().to("cuda")
++    device = get_device()
++    psnr_metric = mPSNR().to(device)
++    ssim_metric = mSSIM().to(device)
+     valid_names = []
+ 
+     for name in tqdm(val_names, desc="Computing BBFG_PSNR / BBFG_SSIM"):
+@@ -207,9 +209,9 @@ def compute_simple_bbfg_metrics(result_dir, val_names):
+         render_path = osp.join(bbox_dir, f"{name}_render.png")
+         if not osp.exists(gt_path) or not osp.exists(render_path):
+             continue
+-        gt = torch.from_numpy(iio.imread(gt_path)[..., :3]).float().to("cuda") / 255.0
++        gt = torch.from_numpy(iio.imread(gt_path)[..., :3]).float().to(device) / 255.0
+         render = (
+-            torch.from_numpy(iio.imread(render_path)[..., :3]).float().to("cuda") / 255.0
++            torch.from_numpy(iio.imread(render_path)[..., :3]).float().to(device) / 255.0
+         )
+         psnr_metric.update(gt, render)
+         ssim_metric.update(gt[None], render[None])
+diff --git a/tests/test_dropin3d_integration.py b/tests/test_dropin3d_integration.py
+new file mode 100644
+index 0000000..0bc6777
+--- /dev/null
++++ b/tests/test_dropin3d_integration.py
+@@ -0,0 +1,64 @@
++"""CPU integration tests for the dropin3d port of 4DGS360.
++
++Run from the repository root (needs `pip install dropin3d`):
++    PYTHONPATH=. pytest tests/test_dropin3d_integration.py
++The dropin3d fallbacks themselves are tested in the dropin3d repository.
++"""
++
++import os
++import sys
++import types
++
++import numpy as np
++import torch
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++
++
++def _install_stubs():
++    """flow3d.init_utils imports viser/cv2 through flow3d.vis.utils."""
++    if "flow3d.vis.utils" not in sys.modules:
++        stub = types.ModuleType("flow3d.vis.utils")
++        stub.get_server = lambda *a, **k: None
++        stub.project_2d_tracks = lambda *a, **k: None
++        sys.modules["flow3d.vis.utils"] = stub
++
++
++def _ref_interp(vals, mask):
++    """Per-track np.interp with edge extension (what interp_masked computes)."""
++    B, M, D = vals.shape
++    out = np.zeros_like(vals)
++    t = np.arange(M)
++    for b in range(B):
++        valid = np.where(mask[b])[0]
++        for d in range(D):
++            out[b, :, d] = np.interp(t, valid, vals[b, valid, d])
++    return out
++
++
++def test_batched_interp_masked_numpy_matches_reference():
++    """CuPy -> NumPy port of the missing-track interpolation."""
++    _install_stubs()
++    from flow3d import init_utils
++
++    rng = np.random.default_rng(0)
++    B, M = 50, 130
++    vals = rng.standard_normal((B, M, 3)).astype(np.float32)
++    mask = rng.random((B, M)) > 0.4
++    mask[:, [0, 64, 128]] = True  # each 64-frame window has a valid frame
++    out = init_utils.batched_interp_masked(vals, mask, batch_num=16, batch_time=64)
++    ref = np.concatenate(
++        [_ref_interp(vals[:, s : s + 64], mask[:, s : s + 64]) for s in range(0, M, 64)],
++        axis=1,
++    )
++    np.testing.assert_allclose(out, ref, rtol=1e-5, atol=1e-5)
++    np.testing.assert_array_equal(out[mask], vals[mask])
++
++
++def test_scene_model_uses_dropin3d_rasterization():
++    _install_stubs()
++    import dropin3d.raster
++    import flow3d.scene_model as sm
++
++    assert sm.rasterization is dropin3d.raster.rasterization
