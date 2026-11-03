@@ -77,6 +77,9 @@ mpsplat의 래스터라이저는 gsplat 1.5.3 CUDA 커널과 합성 규칙이 �
 [`third_party/mpsplat-patches/`](third_party/mpsplat-patches/)의 patch를 적용하면 Metal 커널과 PyTorch 경로가 모두 gsplat 1.5.3과 같은 규칙을 따릅니다.
 Mac에서 [`tools/check_mpsplat_parity.py`](tools/check_mpsplat_parity.py)로 두 경로를 비교할 수 있습니다.
 
+## 작업 계획
+남은 마일스톤(M2~M8)의 목표, 작업 순서, 통과 기준은 [`docs/ROADMAP.md`](docs/ROADMAP.md)에 있습니다.
+
 ## 통합 예시
 - [4DGS360](https://github.com/Jaewon040/4DGS360): [`integrations/4dgs360/`](integrations/4dgs360/), 상세 문서는 [`docs/4dgs360.md`](docs/4dgs360.md)
 
